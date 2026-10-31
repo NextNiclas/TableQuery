@@ -242,12 +242,15 @@ func printColumns(w io.Writer, cols []importer.Column) {
 }
 
 func newQueryCmd() *cobra.Command {
-	var dbPath, out, format, delimiter string
+	var dbPath, out, format, delimiter, into, ifExists string
+	var view bool
 	cmd := &cobra.Command{
 		Use:   "query <sql>",
 		Short: "Run SQL against a database and print or export the result",
 		Example: `  tablequery query --db data.db "SELECT region, sum(umsatz) FROM sales GROUP BY region"
-  tablequery query --db data.db "SELECT * FROM sales" --out sales.csv --delimiter ";"`,
+  tablequery query --db data.db "SELECT * FROM sales" --out sales.csv --delimiter ";"
+  tablequery query --db data.db "SELECT region, sum(umsatz) AS total FROM sales GROUP BY region" --into sales_by_region
+  tablequery query --db data.db "SELECT * FROM sales WHERE umsatz > 1000" --into big_sales --view --if-exists replace`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if dbPath == "" {
@@ -274,6 +277,21 @@ func newQueryCmd() *cobra.Command {
 				}
 			}
 			last := stmts[len(stmts)-1]
+			if into != "" {
+				rows, err := d.CreateFromQuery(ctx, into, last, db.DeriveOptions{View: view, IfExists: ifExists})
+				if err != nil {
+					return err
+				}
+				if view {
+					fmt.Fprintf(cmd.OutOrStdout(), "Created view %s\n", into)
+				} else {
+					fmt.Fprintf(cmd.OutOrStdout(), "Created table %s (%d rows)\n", into, rows)
+				}
+				return nil
+			}
+			if view {
+				return fmt.Errorf("--view requires --into")
+			}
 			if out != "" {
 				n, err := export.QueryToCSV(ctx, d, last, out, opts)
 				if err != nil {
@@ -307,6 +325,9 @@ func newQueryCmd() *cobra.Command {
 	f.StringVarP(&out, "out", "o", "", "write the result to this CSV file")
 	f.StringVarP(&format, "format", "f", "table", "stdout format: table or csv")
 	f.StringVar(&delimiter, "delimiter", ",", "CSV delimiter")
+	f.StringVar(&into, "into", "", "store the query result as a new table with this name")
+	f.BoolVar(&view, "view", false, "with --into: create a view instead of a table")
+	f.StringVar(&ifExists, "if-exists", db.IfExistsFail, "with --into: fail, replace or append (tables only)")
 	return cmd
 }
 

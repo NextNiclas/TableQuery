@@ -34,6 +34,8 @@ type sidebar struct {
 	offset   int
 	height   int
 	focused  bool
+
+	selectName string // move the cursor to this table on the next refresh
 }
 
 func newSidebar() sidebar {
@@ -42,6 +44,14 @@ func newSidebar() sidebar {
 
 func (s *sidebar) set(msg schemaMsg) {
 	s.tables, s.err = msg.tables, msg.err
+	if s.selectName != "" {
+		for i, t := range s.tables {
+			if strings.EqualFold(t.Name, s.selectName) {
+				s.cursor = i
+			}
+		}
+		s.selectName = ""
+	}
 	if s.cursor >= len(s.tables) {
 		s.cursor = max(0, len(s.tables)-1)
 	}

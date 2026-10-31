@@ -5,6 +5,7 @@ Import CSV and Excel files into SQLite and query them with SQL — in a terminal
 - **In-memory or persistent databases** – start without arguments for a throw-away in-memory DB, or pass a file to open/create one. In-memory databases can be saved to a file at any time.
 - **Multiple query tabs** – each tab has its own SQL editor and result table (scrollable in both directions).
 - **CSV export** of any result (all rows, delimiter selectable).
+- **New tables from queries** – store a query result as a table (snapshot) or as a view (always up to date).
 - **Many tables per database** – sidebar lists tables, views, row counts and columns.
 - **Import wizard with live preview**
   - CSV: auto-detected delimiter (`,` `;` Tab `|` or any custom character) and encoding (UTF-8, Windows-1252, ISO-8859-1, UTF-16)
@@ -43,6 +44,7 @@ tablequery -i sales.xlsx    # start with the import wizard for a file
 | `F2` | rename tab |
 | `Ctrl+F` | import wizard |
 | `Ctrl+E` | export result to CSV (`Ctrl+D` in the dialog changes the delimiter) |
+| `Ctrl+N` | create a table or view from the query (name, table/view, if exists: fail / replace / append) |
 | `Ctrl+O` | open / create a database file (`:memory:` for a new in-memory DB) |
 | `Ctrl+S` | save database as file (an in-memory DB is then continued in that file) |
 | `Ctrl+B` | show / hide the table sidebar |
@@ -51,6 +53,8 @@ tablequery -i sales.xlsx    # start with the import wizard for a file
 
 Results: arrows / `PgUp` `PgDn` `Home` `End` scroll, `0`/`$` first/last column.
 Tables sidebar: `Enter` runs `SELECT * … LIMIT 100`, `i` inserts the table name, `→`/`Space` shows columns, `d` drops, `r` refreshes.
+
+`Ctrl+N` uses the last statement in the editor, which must be a `SELECT`/`WITH`/`VALUES` query; earlier statements are not executed.
 
 Path inputs support `Tab` completion. The result view holds at most 10,000 rows; exports always contain all rows.
 
@@ -76,6 +80,11 @@ tablequery import export.csv --columns stadt,plz --type plz=TEXT --dry-run
 tablequery query --db data.db "SELECT bundesland, sum(anzahl_einwohner) FROM cities GROUP BY 1"
 tablequery query --db data.db "SELECT * FROM cities" --out cities.csv --delimiter ";"
 tablequery query --db data.db "SELECT * FROM cities" --format csv
+
+# store query results as new tables or views
+tablequery query --db data.db "SELECT bundesland, sum(anzahl_einwohner) AS einwohner FROM cities GROUP BY 1" --into by_state
+tablequery query --db data.db "SELECT * FROM cities WHERE anzahl_einwohner > 1000000" --into big_cities --view
+tablequery query --db data.db "SELECT ..." --into by_state --if-exists replace   # or append
 
 # schema
 tablequery tables --db data.db

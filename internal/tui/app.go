@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
@@ -77,6 +78,7 @@ type Model struct {
 	wizard  *wizard
 	prompt  *prompt
 	confirm *confirmDialog
+	derive  *deriveDialog
 	help    bool
 
 	status    string
@@ -257,6 +259,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
+	case deriveDoneMsg:
+		if m.derive != nil {
+			m.derive.busy = false
+			if msg.err != nil {
+				m.derive.err = msg.err
+				return m, nil
+			}
+		}
+		m.derive = nil
+		kind := "table"
+		detail := fmt.Sprintf(" (%d rows)", msg.rows)
+		if msg.view {
+			kind, detail = "view", ""
+		}
+		m.setStatus(fmt.Sprintf("Created %s %s%s", kind, msg.name, detail), false)
+		m.side.selectName = msg.name
+		return m, tea.Batch(loadSchema(m.db), m.setFocus(m.focus))
+
 	case importProgressMsg, importDoneMsg:
 		if m.wizard != nil {
 			return m, m.wizard.Update(msg)
@@ -273,6 +293,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if m.prompt != nil {
 		return m, m.prompt.input.Update(msg)
+	}
+	if m.derive != nil {
+		var cmd tea.Cmd
+		m.derive.name, cmd = m.derive.name.Update(msg)
+		return m, cmd
 	}
 	var cmd tea.Cmd
 	t := m.tab()
@@ -325,6 +350,14 @@ func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 	if m.prompt != nil {
 		return m.updatePrompt(k)
 	}
+	if m.derive != nil {
+		cmd, closed := m.derive.Update(k, m.db)
+		if closed {
+			m.derive = nil
+			return m.setFocus(m.focus)
+		}
+		return cmd
+	}
 	if m.help {
 		m.help = false
 		return nil
@@ -376,6 +409,15 @@ func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 		}
 		m.openPrompt(promptSaveDB, title, hint, def)
 		return nil
+	case "ctrl+n":
+		q, err := db.QueryStatement(t.editor.Value())
+		if err != nil {
+			m.setStatus("New table from query: "+err.Error(), true)
+			return nil
+		}
+		m.derive = newDeriveDialog(q, defaultDeriveName(t.title))
+		t.editor.Blur()
+		return textinput.Blink
 	case "ctrl+e":
 		if t.result == nil || !t.result.IsQuery {
 			m.setStatus("Nothing to export: run a query first", true)
@@ -674,6 +716,9 @@ func (m *Model) View() string {
 	if m.prompt != nil {
 		return m.center(m.promptView())
 	}
+	if m.derive != nil {
+		return m.center(m.derive.View(m.width))
+	}
 
 	t := m.tab()
 	mw := m.mainWidth()
@@ -763,7 +808,7 @@ func (m *Model) statusBar() string {
 	case focusSidebar:
 		hints = keyHelp("Enter", "query", "i", "insert name", "→", "columns", "d", "drop", "Ctrl+F", "import", "F1", "help")
 	default:
-		hints = keyHelp("Ctrl+R", "run", "Ctrl+F", "import", "Ctrl+T/W", "new/close tab", "Ctrl+E", "export", "Ctrl+O", "open DB", "Ctrl+S", "save DB", "F1", "help")
+		hints = keyHelp("Ctrl+R", "run", "Ctrl+F", "import", "Ctrl+T/W", "new/close tab", "Ctrl+E", "export", "Ctrl+N", "table from query", "Ctrl+O", "open DB", "Ctrl+S", "save DB", "F1", "help")
 	}
 	return line + "\n" + truncateANSI(hints, m.width)
 }
@@ -802,6 +847,7 @@ func helpView() string {
 		{"F2", "rename tab"},
 		{"Ctrl+F", "import a CSV or Excel file (wizard)"},
 		{"Ctrl+E", "export result to CSV"},
+		{"Ctrl+N", "create a table or view from the query"},
 		{"Ctrl+O", "open / create a database file (or :memory:)"},
 		{"Ctrl+S", "save database as file"},
 		{"Ctrl+B", "show / hide table sidebar"},
