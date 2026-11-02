@@ -92,6 +92,18 @@ tablequery tables --db data.db
 
 `--skip`, `--columns` and `--type` accept the original header or the normalized column name.
 
+## Releases
+
+Prebuilt binaries are attached to the [GitHub releases](https://github.com/NextNiclas/TableQuery/releases) (Windows `.zip` with `checksums.txt`; `tablequery --version` shows the version).
+
+To cut a release, push a version tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The `Release` workflow runs vet and tests and builds the binaries with `CGO_ENABLED=0`. To keep the pipeline cheap only **Windows (amd64)** is built for now; Linux (amd64/arm64) and macOS (amd64/arm64) are already declared in `.github/workflows/release.yml` and are switched on by setting their `"enabled"` flag to `true`. Tags containing a `-` (e.g. `v0.2.0-rc1`) are published as pre-releases.
+
 ## Development
 
 ```sh
