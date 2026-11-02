@@ -1,0 +1,109 @@
+name: Release
+
+# Cut a release by pushing a version tag:
+#   git tag v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - id: targets
+        # All supported platforms are listed here. Only targets with
+        # "enabled": true are built, so disabled ones cost nothing.
+        # To ship another platform, flip its flag to true.
+        run: |
+          cat > targets.json <<'JSON'
+          [
+            {"goos": "windows", "goarch": "amd64", "enabled": true},
+            {"goos": "linux",   "goarch": "amd64", "enabled": false},
+            {"goos": "linux",   "goarch": "arm64", "enabled": false},
+            {"goos": "darwin",  "goarch": "amd64", "enabled": false},
+            {"goos": "darwin",  "goarch": "arm64", "enabled": false}
+          ]
+          JSON
+          echo "matrix=$(jq -c '{include: map(select(.enabled))}' targets.json)" >> "$GITHUB_OUTPUT"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-go@v5.4.0
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
+  build:
+    needs: [prepare, test]
+    runs-on: ubuntu-latest # pure Go (CGO_ENABLED=0): every target cross-compiles here
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-go@v5.4.0
+        with:
+          go-version-file: go.mod
+      - name: Build and package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          name="tablequery_${TAG}_${GOOS}_${GOARCH}"
+          bin=tablequery
+          [ "$GOOS" = windows ] && bin=tablequery.exe
+          mkdir -p "dist/$name"
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/nextniclas/tablequery/internal/cli.Version=${TAG}" \
+            -o "dist/$name/$bin" ./cmd/tablequery
+          cp README.md "dist/$name/"
+          cd dist
+          if [ "$GOOS" = windows ]; then
+            zip -r "$name.zip" "$name"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -r "$name"
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: tablequery_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4.2.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > checksums.txt && cat checksums.txt
+      - uses: softprops/action-gh-release@v2.2.2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(env.TAG, '-') }}
