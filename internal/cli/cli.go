@@ -82,14 +82,21 @@ Several files (or patterns such as "sales_*.csv", or a directory) go into the
 same table. The first file defines names, types and skipped columns; the other
 files are mapped onto it by header, so their column order may differ. Columns
 missing in a file become NULL, additional columns are ignored. The import is
-all-or-nothing. With --source-column every row records the file it came from.`,
+all-or-nothing. With --source-column every row records the file it came from.
+
+To add rows to an existing table use --table <name> --if-exists append. The
+file columns are then matched to the table's columns by name (the original
+header, the normalized name, case-insensitive), converted to the table's
+types, and columns without counterpart are ignored (file) or left NULL
+(table). --dry-run shows the mapping.`,
 		Example: `  tablequery import cities.csv --db data.db
   tablequery import report.xlsx --db data.db --sheet "Q1" --header-row 3 --table q1
   tablequery import export.csv --db data.db --delimiter ";" --skip "Kommentar,Intern" --if-exists replace
   tablequery import export.csv --db data.db --type plz=TEXT --type umsatz=REAL --dry-run
   tablequery import "sales_*.csv" --db data.db --table sales --source-column
   tablequery import jan.xlsx feb.xlsx mar.xlsx --db data.db --table sales
-  tablequery import ./monthly-exports/ --db data.db --table sales --if-exists replace`,
+  tablequery import ./monthly-exports/ --db data.db --table sales --if-exists replace
+  tablequery import march.csv --db data.db --table sales --if-exists append --dry-run`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			paths, err := importer.ExpandPaths(args)
@@ -156,9 +163,32 @@ all-or-nothing. With --source-column every row records the file it came from.`,
 			if len(paths) > 1 {
 				fmt.Fprintf(out, "%d files; columns taken from %s, others mapped by header\n\n", len(paths), filepath.Base(path))
 			}
-			printColumns(out, cols)
+			var plan *importer.AppendPlan
+			if ifExists == importer.IfExistsAppend && dbPath != "" {
+				if _, err := os.Stat(dbPath); err == nil {
+					d, err := db.Open(dbPath)
+					if err != nil {
+						return err
+					}
+					exists, _ := importer.TableExists(context.Background(), d.DB, table)
+					if exists {
+						plan, err = importer.PlanAppend(context.Background(), d.DB, table, cols, sourceColumn)
+					}
+					d.Close()
+					if err != nil {
+						return err
+					}
+				}
+			}
+			if plan != nil {
+				printAppendPlan(out, plan)
+			} else {
+				printColumns(out, cols)
+			}
 			if dryRun {
-				fmt.Fprintln(out, "\n"+t.CreateTableSQL())
+				if plan == nil {
+					fmt.Fprintln(out, "\n"+t.CreateTableSQL())
+				}
 				if len(paths) > 1 {
 					plan, err := importer.PlanFiles(paths, opts, cols)
 					if err != nil {
@@ -188,6 +218,12 @@ all-or-nothing. With --source-column every row records the file it came from.`,
 				printFiles(out, res.Files)
 			}
 			fmt.Fprintf(out, "Imported %d rows from %d file(s) into %s (%s)\n", res.Rows, len(res.Files), res.Table, dbPath)
+			if len(res.Ignored) > 0 {
+				fmt.Fprintf(out, "Ignored file columns (not in the table): %s\n", strings.Join(res.Ignored, ", "))
+			}
+			if len(res.Nulled) > 0 {
+				fmt.Fprintf(out, "Table columns without data (NULL): %s\n", strings.Join(res.Nulled, ", "))
+			}
 			if res.Warnings > 0 {
 				fmt.Fprintf(out, "%d values could not be converted and were stored as text, e.g.:\n", res.Warnings)
 				for _, s := range res.Samples {
@@ -215,6 +251,23 @@ all-or-nothing. With --source-column every row records the file it came from.`,
 	f.BoolVar(&keepEmpty, "keep-empty", false, "keep rows where all cells are empty")
 	f.BoolVar(&dryRun, "dry-run", false, "only show the detected columns and the CREATE TABLE statement")
 	return cmd
+}
+
+// printAppendPlan shows how file columns map onto an existing table.
+func printAppendPlan(w io.Writer, p *importer.AppendPlan) {
+	fmt.Fprintf(w, "Appending to existing table %s\n\n", p.Table)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "FILE COLUMN\tTABLE COLUMN\tTYPE")
+	for _, c := range p.Mapped {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", c.Source, c.Name, c.Type)
+	}
+	tw.Flush()
+	if len(p.Ignored) > 0 {
+		fmt.Fprintf(w, "\nIgnored file columns (not in the table): %s\n", strings.Join(p.Ignored, ", "))
+	}
+	if len(p.Nulled) > 0 {
+		fmt.Fprintf(w, "Table columns without data (NULL): %s\n", strings.Join(p.Nulled, ", "))
+	}
 }
 
 // printFiles lists the files of a multi-file import with mapping notes.

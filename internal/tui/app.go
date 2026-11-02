@@ -504,6 +504,18 @@ func (m *Model) updateSidebar(k tea.KeyMsg) tea.Cmd {
 			m.tab().editor.InsertString(importer.QuoteIdent(tbl.Name))
 			return m.setFocus(focusEditor)
 		}
+	case "m":
+		if !ok {
+			return nil
+		}
+		if tbl.IsView {
+			m.setStatus("Rows can only be imported into tables, not views", true)
+			return nil
+		}
+		m.wizard = newWizard(m.db, "")
+		m.wizard.preset = tbl.Name
+		m.wizard.setSize(m.width, m.height)
+		return m.wizard.Init()
 	case "r":
 		return loadSchema(m.db)
 	case "d", "delete":
@@ -806,7 +818,7 @@ func (m *Model) statusBar() string {
 	case focusGrid:
 		hints = keyHelp("↑↓←→", "scroll", "PgUp/PgDn", "page", "Ctrl+E", "export", "Tab", "focus", "F1", "help")
 	case focusSidebar:
-		hints = keyHelp("Enter", "query", "i", "insert name", "→", "columns", "d", "drop", "Ctrl+F", "import", "F1", "help")
+		hints = keyHelp("Enter", "query", "i", "insert name", "m", "import into", "d", "drop", "Ctrl+F", "import", "F1", "help")
 	default:
 		hints = keyHelp("Ctrl+R", "run", "Ctrl+F", "import", "Ctrl+T/W", "new/close tab", "Ctrl+E", "export", "Ctrl+N", "table from query", "Ctrl+O", "open DB", "Ctrl+S", "save DB", "F1", "help")
 	}
@@ -855,7 +867,7 @@ func helpView() string {
 		{"Ctrl+Q / Ctrl+C", "quit"},
 		{"", ""},
 		{"Results", "↑↓ PgUp PgDn Home End rows · ←→ columns · 0/$ first/last column"},
-		{"Tables", "Enter query · i insert name · →/Space columns · d drop · r refresh"},
+		{"Tables", "Enter query · i insert name · m import file into table · →/Space columns · d drop · r refresh"},
 	}
 	var b strings.Builder
 	b.WriteString(styleTitle.Render("TableQuery — keyboard shortcuts") + "\n\n")

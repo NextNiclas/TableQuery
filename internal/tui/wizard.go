@@ -94,6 +94,10 @@ type wizard struct {
 	srcColOn    bool
 	srcColInput textinput.Model
 
+	preset  string // existing table chosen up front (sidebar: import into table)
+	plan    *importer.AppendPlan
+	planErr error
+
 	progress importer.Progress
 	result   *importer.Result
 	err      error
@@ -319,12 +323,18 @@ func (w *wizard) proceed() tea.Cmd {
 	w.srcField = 0
 	w.analysis = nil
 	w.setTableName(w.defaultTableName())
+	if w.preset != "" {
+		w.ifExists = indexOf(importer.IfExistsModes, importer.IfExistsAppend)
+	}
 	w.step = stepSource
 	w.loadPreview()
 	return nil
 }
 
 func (w *wizard) defaultTableName() string {
+	if w.preset != "" {
+		return w.preset
+	}
 	if len(w.files) > 1 {
 		if n := importer.CommonTableName(w.files); n != "" {
 			return n
@@ -602,6 +612,39 @@ func (w *wizard) checkTableExists() {
 	if name != "" {
 		w.tableExists, _ = importer.TableExists(context.Background(), w.db.DB, name)
 	}
+	w.refreshPlan()
+}
+
+// refreshPlan recomputes the column mapping shown when appending to an
+// existing table.
+func (w *wizard) refreshPlan() {
+	w.plan, w.planErr = nil, nil
+	if !w.tableExists || importer.IfExistsModes[w.ifExists] != importer.IfExistsAppend {
+		return
+	}
+	t := w.target()
+	w.plan, w.planErr = importer.PlanAppend(context.Background(), w.db.DB, t.Table, w.cols, t.SourceColumn)
+}
+
+// pickTable cycles the table name through the existing tables and switches
+// to appending.
+func (w *wizard) pickTable() {
+	names, err := importer.ListTables(context.Background(), w.db.DB)
+	if err != nil || len(names) == 0 {
+		w.previewErr = fmt.Errorf("the database has no tables yet")
+		return
+	}
+	cur := strings.TrimSpace(w.tableInput.Value())
+	next := 0
+	for i, n := range names {
+		if strings.EqualFold(n, cur) {
+			next = (i + 1) % len(names)
+		}
+	}
+	w.previewErr = nil
+	w.setTableName(names[next])
+	w.ifExists = indexOf(importer.IfExistsModes, importer.IfExistsAppend)
+	w.checkTableExists()
 }
 
 func (w *wizard) target() importer.Target {
@@ -633,8 +676,15 @@ func (w *wizard) updateTarget(k tea.KeyMsg) tea.Cmd {
 			w.previewErr = fmt.Errorf("table %q exists: choose replace or append (or another name)", t.Table)
 			return nil
 		}
+		if w.tableExists && t.IfExists == importer.IfExistsAppend && w.planErr != nil {
+			w.previewErr = w.planErr
+			return nil
+		}
 		w.previewErr = nil
 		return w.startImport(t)
+	case "ctrl+t":
+		w.pickTable()
+		return nil
 	case "up", "down", "tab", "shift+tab":
 		if key == "up" || key == "shift+tab" {
 			w.targetField = (w.targetField + 2) % 3
@@ -659,11 +709,13 @@ func (w *wizard) updateTarget(k tea.KeyMsg) tea.Cmd {
 		case "right", " ":
 			w.ifExists = (w.ifExists + 1) % len(importer.IfExistsModes)
 		}
+		w.refreshPlan()
 		return nil
 	case 2:
 		switch key {
 		case "left", "right", " ":
 			w.srcColOn = !w.srcColOn
+			w.refreshPlan()
 			if w.srcColOn {
 				return w.srcColInput.Focus()
 			}
@@ -673,6 +725,7 @@ func (w *wizard) updateTarget(k tea.KeyMsg) tea.Cmd {
 		if w.srcColOn {
 			var cmd tea.Cmd
 			w.srcColInput, cmd = w.srcColInput.Update(k)
+			w.refreshPlan()
 			return cmd
 		}
 		return nil
@@ -720,7 +773,11 @@ func waitForImport(ch chan tea.Msg) tea.Cmd {
 
 func (w *wizard) View() string {
 	var b strings.Builder
-	b.WriteString(styleTitle.Render("Import wizard") + "   " + w.stepBar() + "\n")
+	title := "Import wizard"
+	if w.preset != "" {
+		title = "Import into " + w.preset
+	}
+	b.WriteString(styleTitle.Render(title) + "   " + w.stepBar() + "\n")
 	if w.path != "" && w.step > stepFile {
 		info := fmt.Sprintf("%s (%s)", w.path, w.format)
 		if n := len(w.files); n > 1 {
@@ -1050,7 +1107,9 @@ func (w *wizard) viewTarget() string {
 		}
 	}
 	b.WriteString(fmt.Sprintf("\nColumns: %d imported, %d skipped\n\n", len(w.cols)-skipped, skipped))
-	if t.Table != "" && !(w.tableExists && t.IfExists == importer.IfExistsAppend) {
+	if w.tableExists && t.IfExists == importer.IfExistsAppend {
+		b.WriteString(w.viewAppendPlan())
+	} else if t.Table != "" {
 		sql := t.CreateTableSQL()
 		lines := strings.Split(sql, "\n")
 		maxLines := max(4, w.height-22)
@@ -1059,7 +1118,35 @@ func (w *wizard) viewTarget() string {
 		}
 		b.WriteString(styleMuted.Render(strings.Join(lines, "\n")) + "\n")
 	}
-	b.WriteString("\n" + keyHelp("↑/↓", "field", "←/→", "change", "Enter", "import", "Esc", "back"))
+	b.WriteString("\n" + keyHelp("↑/↓", "field", "←/→", "change", "Ctrl+T", "existing table", "Enter", "import", "Esc", "back"))
+	return b.String()
+}
+
+// viewAppendPlan shows how the file columns map onto the existing table.
+func (w *wizard) viewAppendPlan() string {
+	if w.planErr != nil {
+		return styleError.Render("⚠ "+oneLine(w.planErr.Error())) + "\n"
+	}
+	p := w.plan
+	if p == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(styleTitle.Render("Adding rows to existing table "+p.Table) + styleMuted.Render("  (columns matched by name, types of the table)") + "\n")
+	maxRows := max(3, w.height-26)
+	for i, c := range p.Mapped {
+		if i == maxRows {
+			b.WriteString(styleMuted.Render(fmt.Sprintf("  … %d more", len(p.Mapped)-maxRows)) + "\n")
+			break
+		}
+		b.WriteString(fmt.Sprintf("  %s → %s %s\n", fit(cleanCell(c.Source), 24, false), fit(c.Name, 24, false), styleMuted.Render(string(c.Type))))
+	}
+	if len(p.Ignored) > 0 {
+		b.WriteString(styleWarn.Render("  not in table, ignored: "+strings.Join(p.Ignored, ", ")) + "\n")
+	}
+	if len(p.Nulled) > 0 {
+		b.WriteString(styleMuted.Render("  table columns left empty: "+strings.Join(p.Nulled, ", ")) + "\n")
+	}
 	return b.String()
 }
 
@@ -1072,6 +1159,12 @@ func (w *wizard) viewDone() string {
 	}
 	r := w.result
 	b.WriteString(styleOK.Render(fmt.Sprintf("✔ Imported %d rows into %q", r.Rows, r.Table)) + "\n")
+	if len(r.Ignored) > 0 {
+		b.WriteString(styleWarn.Render("  ignored file columns (not in the table): "+strings.Join(r.Ignored, ", ")) + "\n")
+	}
+	if len(r.Nulled) > 0 {
+		b.WriteString(styleMuted.Render("  table columns without data: "+strings.Join(r.Nulled, ", ")) + "\n")
+	}
 	if len(r.Files) > 1 {
 		b.WriteString("\n")
 		for _, f := range r.Files {

@@ -133,6 +133,11 @@ type Result struct {
 	Warnings int      // values that could not be converted (stored as text)
 	Samples  []string // first few warning messages
 	Files    []FileResult
+
+	// Appending to an existing table: file columns that had no counterpart
+	// in the table, and table columns that received no value.
+	Ignored []string
+	Nulled  []string
 }
 
 // Progress is reported while importing.
@@ -370,6 +375,15 @@ func ImportFiles(ctx context.Context, db *sql.DB, paths []string, opts SourceOpt
 	if exists && t.IfExists == IfExistsFail {
 		return nil, fmt.Errorf("table %q already exists (choose replace or append)", t.Table)
 	}
+	// Appending maps the file onto the columns and types of the existing
+	// table instead of using the names derived from the file.
+	var plan *AppendPlan
+	if exists && t.IfExists == IfExistsAppend {
+		if plan, err = PlanAppend(ctx, db, t.Table, t.Columns, t.SourceColumn); err != nil {
+			return nil, err
+		}
+		t.Columns = plan.Mapped
+	}
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -411,6 +425,9 @@ func ImportFiles(ctx context.Context, db *sql.DB, paths []string, opts SourceOpt
 
 	multi := len(paths) > 1
 	res := &Result{Table: t.Table}
+	if plan != nil {
+		res.Ignored, res.Nulled = plan.Ignored, plan.Nulled
+	}
 	for i, path := range paths {
 		fail := func(err error) (*Result, error) {
 			if multi {
