@@ -52,7 +52,7 @@ tablequery -i sales.xlsx    # start with the import wizard for a file
 | `Ctrl+Q` / `Ctrl+C` | quit |
 
 Results: arrows / `PgUp` `PgDn` `Home` `End` scroll, `0`/`$` first/last column.
-Tables sidebar: `Enter` runs `SELECT * … LIMIT 100`, `i` inserts the table name, `→`/`Space` shows columns, `d` drops, `r` refreshes.
+Tables sidebar: `Enter` runs `SELECT * … LIMIT 100`, `i` inserts the table name, `m` imports a file into the table, `→`/`Space` shows columns, `d` drops, `r` refreshes.
 
 `Ctrl+N` uses the last statement in the editor, which must be a `SELECT`/`WITH`/`VALUES` query; earlier statements are not executed.
 
@@ -66,6 +66,16 @@ Path inputs support `Tab` completion. The result view holds at most 10,000 rows;
 4. **Target** – table name and what to do if it already exists. Shows the `CREATE TABLE` statement.
 
 Values that cannot be converted to the chosen type are kept as text and reported after the import. Empty cells become `NULL`. Dates are stored as ISO text (`2024-01-15`, `2024-01-15 10:30:00`) so SQLite's date functions work; booleans are stored as `0`/`1`.
+
+### Importing into an existing table
+
+Add rows to a table that already exists instead of creating a new one:
+
+- **Tables sidebar:** select the table and press `m`; the wizard opens with this table preselected.
+- **Wizard:** in the Target step press `Ctrl+T` to pick one of the existing tables, or type its name and set *If table exists* to `append`.
+- **CLI:** `tablequery import march.csv --db data.db --table sales --if-exists append` (`--dry-run` shows the mapping first).
+
+The file's columns are matched to the table's columns by name: the target name from the Columns step (so you can rename a column there to force a match), else the original header or its normalized form, case-insensitive. Values are converted to the **table's column types**. File columns without a counterpart are ignored, table columns without a file column stay empty (`NULL`/default); both are shown before and after the import. If nothing matches, or the target is a view, nothing is imported. With *Source file column* the table needs a column of that name.
 
 ### Importing several files into one table
 
