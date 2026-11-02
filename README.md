@@ -67,6 +67,16 @@ Path inputs support `Tab` completion. The result view holds at most 10,000 rows;
 
 Values that cannot be converted to the chosen type are kept as text and reported after the import. Empty cells become `NULL`. Dates are stored as ISO text (`2024-01-15`, `2024-01-15 10:30:00`) so SQLite's date functions work; booleans are stored as `0`/`1`.
 
+### Importing several files into one table
+
+Enter a pattern (`sales_*.csv`) or a folder in the wizard's file step to collect many files, or add single files with `Ctrl+L` (`Ctrl+X` removes the last one). `Enter` on an empty line continues. A single plain file path still continues immediately.
+
+- The **first file** defines column names, types and skipped columns.
+- Every other file is mapped **by header** (case-insensitive, or by normalized name), so its column order may differ and its delimiter/encoding is detected on its own. Excel files use the same sheet name (or their only sheet).
+- Columns missing in a file become `NULL`; additional columns are ignored. Both are listed per file after the import. Decimal separators are re-detected per file.
+- Optionally add a **source file column** (default `source_file`) holding each row's file name.
+- All files must be CSV-like or all Excel. The import is all-or-nothing: if one file fails nothing is written.
+
 ## Command line
 
 ```sh
@@ -75,6 +85,11 @@ tablequery import cities.csv --db data.db
 tablequery import report.xlsx --db data.db --sheet Q1 --header-row 3 --table q1
 tablequery import export.csv --db data.db --delimiter ";" --skip "Kommentar,Intern" --if-exists replace
 tablequery import export.csv --columns stadt,plz --type plz=TEXT --dry-run
+
+# several files into one table (patterns are expanded by the tool, also on Windows)
+tablequery import "sales_*.csv" --db data.db --table sales --source-column
+tablequery import jan.xlsx feb.xlsx --db data.db --table sales
+tablequery import ./monthly-exports/ --db data.db --table sales --if-exists append
 
 # query / aggregate
 tablequery query --db data.db "SELECT bundesland, sum(anzahl_einwohner) FROM cities GROUP BY 1"

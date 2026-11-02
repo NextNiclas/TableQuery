@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -43,7 +44,7 @@ const (
 
 var decimalModes = []byte{0, '.', ','}
 
-type importProgressMsg struct{ rows int }
+type importProgressMsg struct{ p importer.Progress }
 type importDoneMsg struct {
 	res *importer.Result
 	err error
@@ -64,10 +65,14 @@ type wizard struct {
 	step wizardStep
 
 	file   pathInput
-	path   string
+	files  []string // all files to import; files[0] defines the columns
+	path   string   // == files[0]
 	format importer.Format
 	sheets []string
 	opts   importer.SourceOptions
+
+	sniffDelim rune // delimiter/encoding detected for the first CSV file
+	sniffEnc   string
 
 	preview    [][]string
 	previewErr error
@@ -86,8 +91,10 @@ type wizard struct {
 	ifExists    int
 	targetField int
 	tableExists bool
+	srcColOn    bool
+	srcColInput textinput.Model
 
-	progress int
+	progress importer.Progress
 	result   *importer.Result
 	err      error
 	cancel   context.CancelFunc
@@ -106,6 +113,11 @@ func newWizard(d *db.DB, path string) *wizard {
 	w.tableInput = textinput.New()
 	w.tableInput.Prompt = "› "
 	w.tableInput.CharLimit = 128
+	w.srcColInput = textinput.New()
+	w.srcColInput.Prompt = ""
+	w.srcColInput.CharLimit = 64
+	w.srcColInput.Width = 20
+	w.srcColInput.SetValue("source_file")
 	if path != "" {
 		w.file.SetValue(path)
 	}
@@ -134,7 +146,7 @@ func closeWizard(res *importer.Result) tea.Cmd {
 func (w *wizard) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case importProgressMsg:
-		w.progress = msg.rows
+		w.progress = msg.p
 		return waitForImport(w.ch)
 	case importDoneMsg:
 		w.cancel = nil
@@ -160,6 +172,14 @@ func (w *wizard) handleKey(k tea.KeyMsg) tea.Cmd {
 			return closeWizard(nil)
 		case "enter":
 			return w.openFile()
+		case "ctrl+l":
+			return w.addInput(false)
+		case "ctrl+x":
+			if n := len(w.files); n > 0 {
+				w.files = w.files[:n-1]
+				w.previewErr = nil
+			}
+			return nil
 		}
 		return w.file.Update(k)
 
@@ -192,11 +212,70 @@ func (w *wizard) handleKey(k tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
+// openFile handles Enter in the file step: a single plain file path continues
+// right away, a pattern or directory is added to the list, and Enter on an
+// empty line continues with the collected files.
 func (w *wizard) openFile() tea.Cmd {
-	path := w.file.Value()
-	if path == "" {
+	if strings.TrimSpace(w.file.input.Value()) == "" {
+		if len(w.files) == 0 {
+			return nil
+		}
+		return w.proceed()
+	}
+	return w.addInput(true)
+}
+
+// addInput expands the input line (file, glob or directory) and adds the
+// files to the list. With fast set, a single plain file continues directly.
+func (w *wizard) addInput(fast bool) tea.Cmd {
+	raw := strings.TrimSpace(w.file.input.Value())
+	if raw == "" {
 		return nil
 	}
+	input := w.file.Value()
+	paths, err := importer.ExpandPaths([]string{input})
+	if err != nil {
+		w.previewErr = err
+		return nil
+	}
+	merged := append(append([]string(nil), w.files...), paths...)
+	merged = dedupePaths(merged)
+	if err := importer.CheckSameFormat(merged); err != nil {
+		w.previewErr = err
+		return nil
+	}
+	plain := !strings.ContainsAny(input, "*?[")
+	if st, err := os.Stat(input); err == nil && st.IsDir() {
+		plain = false
+	}
+	w.files = merged
+	w.previewErr = nil
+	w.file.SetValue("")
+	if fast && plain && len(w.files) == 1 {
+		return w.proceed()
+	}
+	return nil
+}
+
+func dedupePaths(paths []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range paths {
+		key := p
+		if a, err := filepath.Abs(p); err == nil {
+			key = a
+		}
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// proceed opens the first file and moves on to the source options.
+func (w *wizard) proceed() tea.Cmd {
+	path := w.files[0]
 	st, err := os.Stat(path)
 	if err != nil {
 		w.previewErr = err
@@ -233,15 +312,25 @@ func (w *wizard) openFile() tea.Cmd {
 			return nil
 		}
 		w.opts.Delimiter, w.opts.Encoding = delim, enc
+		w.sniffDelim, w.sniffEnc = delim, enc
 	}
 	w.previewErr = nil
 	w.previewKey = ""
 	w.srcField = 0
 	w.analysis = nil
-	w.setTableName(importer.TableNameFor(path, w.sheetForName()))
+	w.setTableName(w.defaultTableName())
 	w.step = stepSource
 	w.loadPreview()
 	return nil
+}
+
+func (w *wizard) defaultTableName() string {
+	if len(w.files) > 1 {
+		if n := importer.CommonTableName(w.files); n != "" {
+			return n
+		}
+	}
+	return importer.TableNameFor(w.path, w.sheetForName())
 }
 
 func (w *wizard) setTableName(s string) {
@@ -295,7 +384,7 @@ func (w *wizard) updateSource(k tea.KeyMsg) tea.Cmd {
 		if delta != 0 {
 			i := indexOf(w.sheets, w.opts.Sheet)
 			w.opts.Sheet = w.sheets[(i+delta+len(w.sheets))%len(w.sheets)]
-			w.setTableName(importer.TableNameFor(w.path, w.sheetForName()))
+			w.setTableName(w.defaultTableName())
 		}
 	case fieldDelimiter:
 		cands := importer.DelimiterCandidates
@@ -516,11 +605,15 @@ func (w *wizard) checkTableExists() {
 }
 
 func (w *wizard) target() importer.Target {
-	return importer.Target{
+	t := importer.Target{
 		Table:    strings.TrimSpace(w.tableInput.Value()),
 		IfExists: importer.IfExistsModes[w.ifExists],
 		Columns:  w.cols,
 	}
+	if w.srcColOn {
+		t.SourceColumn = strings.TrimSpace(w.srcColInput.Value())
+	}
+	return t
 }
 
 func (w *wizard) updateTarget(k tea.KeyMsg) tea.Cmd {
@@ -543,19 +636,44 @@ func (w *wizard) updateTarget(k tea.KeyMsg) tea.Cmd {
 		w.previewErr = nil
 		return w.startImport(t)
 	case "up", "down", "tab", "shift+tab":
-		w.targetField = 1 - w.targetField
-		if w.targetField == 0 {
-			return w.tableInput.Focus()
+		if key == "up" || key == "shift+tab" {
+			w.targetField = (w.targetField + 2) % 3
+		} else {
+			w.targetField = (w.targetField + 1) % 3
 		}
 		w.tableInput.Blur()
+		w.srcColInput.Blur()
+		switch {
+		case w.targetField == 0:
+			return w.tableInput.Focus()
+		case w.targetField == 2 && w.srcColOn:
+			return w.srcColInput.Focus()
+		}
 		return nil
 	}
-	if w.targetField == 1 {
+	switch w.targetField {
+	case 1:
 		switch key {
 		case "left":
 			w.ifExists = (w.ifExists + len(importer.IfExistsModes) - 1) % len(importer.IfExistsModes)
 		case "right", " ":
 			w.ifExists = (w.ifExists + 1) % len(importer.IfExistsModes)
+		}
+		return nil
+	case 2:
+		switch key {
+		case "left", "right", " ":
+			w.srcColOn = !w.srcColOn
+			if w.srcColOn {
+				return w.srcColInput.Focus()
+			}
+			w.srcColInput.Blur()
+			return nil
+		}
+		if w.srcColOn {
+			var cmd tea.Cmd
+			w.srcColInput, cmd = w.srcColInput.Update(k)
+			return cmd
 		}
 		return nil
 	}
@@ -568,16 +686,18 @@ func (w *wizard) updateTarget(k tea.KeyMsg) tea.Cmd {
 func (w *wizard) startImport(t importer.Target) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	w.cancel = cancel
-	w.progress = 0
+	w.progress = importer.Progress{}
 	w.step = stepRunning
 	ch := make(chan tea.Msg, 4)
 	w.ch = ch
-	path, opts, d := w.path, w.opts, w.db
+	files, opts, d := append([]string(nil), w.files...), w.opts, w.db
+	// Re-detect delimiter/encoding per file unless the user changed them.
+	opts.AutoDetect = w.format == importer.FormatCSV && opts.Delimiter == w.sniffDelim && opts.Encoding == w.sniffEnc
 	go func() {
 		defer close(ch)
-		res, err := importer.Import(ctx, d.DB, path, opts, t, func(n int) {
+		res, err := importer.ImportFiles(ctx, d.DB, files, opts, t, func(p importer.Progress) {
 			select {
-			case ch <- importProgressMsg{rows: n}:
+			case ch <- importProgressMsg{p: p}:
 			default: // drop progress updates if the UI is busy
 			}
 		})
@@ -603,14 +723,30 @@ func (w *wizard) View() string {
 	b.WriteString(styleTitle.Render("Import wizard") + "   " + w.stepBar() + "\n")
 	if w.path != "" && w.step > stepFile {
 		info := fmt.Sprintf("%s (%s)", w.path, w.format)
+		if n := len(w.files); n > 1 {
+			info = fmt.Sprintf("%s (%s) + %d more files — columns of the first file, others matched by header", w.path, w.format, n-1)
+		}
 		b.WriteString(styleMuted.Render(runewidth.Truncate(info, w.width-4, "…")) + "\n")
 	}
 	b.WriteString("\n")
 	switch w.step {
 	case stepFile:
-		b.WriteString("File to import (.csv, .tsv, .txt, .xlsx, .xlsm):\n\n")
+		b.WriteString("File to import (.csv, .tsv, .txt, .xlsx, .xlsm) — or a pattern like sales_*.csv, or a folder:\n\n")
 		b.WriteString(w.file.View())
-		b.WriteString("\n\n" + keyHelp("Tab", "complete", "Enter", "continue", "Esc", "cancel"))
+		if n := len(w.files); n > 0 {
+			b.WriteString("\n\n" + styleTitle.Render(fmt.Sprintf("%d file(s) selected", n)) + "\n")
+			shown := w.files
+			if len(shown) > 8 {
+				shown = shown[len(shown)-8:]
+				b.WriteString(styleMuted.Render(fmt.Sprintf("  … %d more above", n-8)) + "\n")
+			}
+			for _, f := range shown {
+				b.WriteString("  " + runewidth.Truncate(f, max(20, w.width-10), "…") + "\n")
+			}
+			b.WriteString("\n" + keyHelp("Enter", "continue (empty line) / add", "Ctrl+L", "add file", "Ctrl+X", "remove last", "Tab", "complete", "Esc", "cancel"))
+		} else {
+			b.WriteString("\n\n" + keyHelp("Enter", "continue", "Ctrl+L", "add more files", "Tab", "complete", "Esc", "cancel"))
+		}
 	case stepSource:
 		b.WriteString(w.viewSource())
 	case stepColumns:
@@ -618,7 +754,11 @@ func (w *wizard) View() string {
 	case stepTarget:
 		b.WriteString(w.viewTarget())
 	case stepRunning:
-		b.WriteString(styleWarn.Render(fmt.Sprintf("Importing… %d rows", w.progress)))
+		msg := fmt.Sprintf("Importing… %d rows", w.progress.Rows)
+		if w.progress.Files > 1 {
+			msg = fmt.Sprintf("Importing… file %d/%d, %d rows", w.progress.File, w.progress.Files, w.progress.Rows)
+		}
+		b.WriteString(styleWarn.Render(msg))
 		b.WriteString("\n\n" + keyHelp("Esc", "cancel"))
 	case stepDone:
 		b.WriteString(w.viewDone())
@@ -779,8 +919,12 @@ func (w *wizard) viewColumns() string {
 			included++
 		}
 	}
-	b.WriteString(fmt.Sprintf("%d of %d columns selected · types inferred from %d sample rows\n\n",
+	b.WriteString(fmt.Sprintf("%d of %d columns selected · types inferred from %d sample rows",
 		included, len(w.cols), len(w.analysis.Sample)))
+	if n := len(w.files); n > 1 {
+		b.WriteString(styleMuted.Render(fmt.Sprintf(" · applies to all %d files (matched by header)", n)))
+	}
+	b.WriteString("\n\n")
 	const srcW, nameW, typeW = 22, 26, 9
 	hdr := fmt.Sprintf("    %-4s %s %s %s %s", "", fit("Source column", srcW, false), fit("Column name", nameW, false),
 		fit("Type", typeW, false), "Sample values (converted)")
@@ -862,10 +1006,37 @@ func (w *wizard) viewTarget() string {
 	if w.tableExists {
 		exists = styleWarn.Render("table already exists")
 	}
-	b.WriteString(cursor(1) + fmt.Sprintf("%-16s", "If table exists") + mode + "  " + exists + "\n\n")
+	b.WriteString(cursor(1) + fmt.Sprintf("%-16s", "If table exists") + mode + "  " + exists + "\n")
+	src := "off"
+	if w.srcColOn {
+		src = "on, column "
+	}
+	switch {
+	case w.targetField == 2 && w.srcColOn:
+		src = styleSelected.Render(" ‹ on › ") + " column " + w.srcColInput.View()
+	case w.targetField == 2:
+		src = styleSelected.Render(" ‹ off › ")
+	case w.srcColOn:
+		src = "   on, column " + w.srcColInput.Value()
+	default:
+		src = "   " + src
+	}
+	b.WriteString(cursor(2) + fmt.Sprintf("%-16s", "Source file col.") + src + "  " + styleMuted.Render("file name per row") + "\n\n")
 
 	b.WriteString(styleTitle.Render("Summary") + "\n")
-	b.WriteString(fmt.Sprintf("Source:  %s", w.path))
+	if n := len(w.files); n > 1 {
+		names := make([]string, 0, 4)
+		for _, f := range w.files[:min(n, 4)] {
+			names = append(names, filepath.Base(f))
+		}
+		more := ""
+		if n > 4 {
+			more = fmt.Sprintf(", … +%d", n-4)
+		}
+		b.WriteString(fmt.Sprintf("Files:   %d (%s%s)\nFirst:   %s", n, strings.Join(names, ", "), more, w.path))
+	} else {
+		b.WriteString(fmt.Sprintf("Source:  %s", w.path))
+	}
 	if w.format == importer.FormatXLSX {
 		b.WriteString(fmt.Sprintf(" [sheet %s]", w.opts.Sheet))
 	} else {
@@ -888,7 +1059,7 @@ func (w *wizard) viewTarget() string {
 		}
 		b.WriteString(styleMuted.Render(strings.Join(lines, "\n")) + "\n")
 	}
-	b.WriteString("\n" + keyHelp("↑/↓", "field", "←/→", "if exists", "Enter", "import", "Esc", "back"))
+	b.WriteString("\n" + keyHelp("↑/↓", "field", "←/→", "change", "Enter", "import", "Esc", "back"))
 	return b.String()
 }
 
@@ -901,6 +1072,19 @@ func (w *wizard) viewDone() string {
 	}
 	r := w.result
 	b.WriteString(styleOK.Render(fmt.Sprintf("✔ Imported %d rows into %q", r.Rows, r.Table)) + "\n")
+	if len(r.Files) > 1 {
+		b.WriteString("\n")
+		for _, f := range r.Files {
+			line := fmt.Sprintf("  %-32s %7d rows", runewidth.Truncate(filepath.Base(f.Path), 32, "…"), f.Rows)
+			b.WriteString(line + "\n")
+			if len(f.Missing) > 0 {
+				b.WriteString(styleWarn.Render("      missing (NULL): "+strings.Join(f.Missing, ", ")) + "\n")
+			}
+			if len(f.Extra) > 0 {
+				b.WriteString(styleMuted.Render("      ignored: "+strings.Join(f.Extra, ", ")) + "\n")
+			}
+		}
+	}
 	if r.Warnings > 0 {
 		b.WriteString("\n" + styleWarn.Render(fmt.Sprintf("%d values could not be converted and were stored as text:", r.Warnings)) + "\n")
 		for _, s := range r.Samples {
