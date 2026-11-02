@@ -31,10 +31,10 @@ jobs:
           cat > targets.json <<'JSON'
           [
             {"goos": "windows", "goarch": "amd64", "enabled": true},
-            {"goos": "linux",   "goarch": "amd64", "enabled": false},
-            {"goos": "linux",   "goarch": "arm64", "enabled": false},
+            {"goos": "linux",   "goarch": "amd64", "enabled": true},
+            {"goos": "linux",   "goarch": "arm64", "enabled": true},
             {"goos": "darwin",  "goarch": "amd64", "enabled": false},
-            {"goos": "darwin",  "goarch": "arm64", "enabled": false}
+            {"goos": "darwin",  "goarch": "arm64", "enabled": true}
           ]
           JSON
           echo "matrix=$(jq -c '{include: map(select(.enabled))}' targets.json)" >> "$GITHUB_OUTPUT"

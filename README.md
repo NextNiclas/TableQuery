@@ -109,7 +109,7 @@ tablequery tables --db data.db
 
 ## Releases
 
-Prebuilt binaries are attached to the [GitHub releases](https://github.com/NextNiclas/TableQuery/releases) (Windows `.zip` with `checksums.txt`; `tablequery --version` shows the version).
+Prebuilt binaries are attached to the [GitHub releases](https://github.com/NextNiclas/TableQuery/releases) (Windows `.zip`; Linux amd64/arm64 and macOS Apple Silicon `.tar.gz`; `checksums.txt`; `tablequery --version` shows the version).
 
 To cut a release, push a version tag:
 
@@ -117,7 +117,7 @@ To cut a release, push a version tag:
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-The `Release` workflow runs vet and tests and builds the binaries with `CGO_ENABLED=0`. To keep the pipeline cheap only **Windows (amd64)** is built for now; Linux (amd64/arm64) and macOS (amd64/arm64) are already declared in `.github/workflows/release.yml` and are switched on by setting their `"enabled"` flag to `true`. Tags containing a `-` (e.g. `v0.2.0-rc1`) are published as pre-releases.
+The `Release` workflow runs vet and tests and builds the binaries with `CGO_ENABLED=0`. Built platforms: Windows amd64, Linux amd64/arm64 and macOS arm64 (Apple Silicon). macOS amd64 (Intel) is declared in `.github/workflows/release.yml` but switched off to keep the pipeline cheap; enable it by setting its `"enabled"` flag to `true`. The macOS binary is not code-signed: after downloading run `xattr -d com.apple.quarantine tablequery` once. Tags containing a `-` (e.g. `v0.2.0-rc1`) are published as pre-releases.
 
 ## Development
 
