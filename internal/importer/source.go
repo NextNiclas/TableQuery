@@ -3,7 +3,9 @@ package importer
 import (
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -53,6 +55,10 @@ type SourceOptions struct {
 	StartRow  int    // 1-based first data row
 	SkipEmpty bool   // skip rows where every cell is empty
 	Decimal   byte   // 0 = auto, '.' or ','
+
+	// AutoDetect re-detects delimiter and encoding for every CSV file after
+	// the first one when several files are imported.
+	AutoDetect bool
 }
 
 // Normalize fills defaults and fixes inconsistent values.
@@ -122,4 +128,145 @@ func isEmptyRow(row []string) bool {
 		}
 	}
 	return true
+}
+
+func isSupportedExt(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".csv", ".tsv", ".txt", ".tab", ".dat", ".xlsx", ".xlsm", ".xltx", ".xltm":
+		return true
+	}
+	return false
+}
+
+// ExpandPaths resolves file names, glob patterns (* ? [) and directories
+// (all supported files in them, sorted) into a list of files. Duplicates are
+// removed, the order is kept.
+func ExpandPaths(args []string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	add := func(p string) {
+		key := p
+		if a, err := filepath.Abs(p); err == nil {
+			key = a
+		}
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, p)
+		}
+	}
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg == "" {
+			continue
+		}
+		if strings.ContainsAny(arg, "*?[") {
+			matches, err := filepath.Glob(arg)
+			if err != nil {
+				return nil, fmt.Errorf("invalid pattern %q: %w", arg, err)
+			}
+			n := 0
+			patBase := filepath.Base(arg)
+			for _, m := range matches {
+				name := filepath.Base(m)
+				if (strings.HasPrefix(name, ".") && !strings.HasPrefix(patBase, ".")) || strings.HasPrefix(name, "~$") {
+					continue // hidden and Office lock files, like a shell glob
+				}
+				if st, err := os.Stat(m); err == nil && !st.IsDir() {
+					add(m)
+					n++
+				}
+			}
+			if n == 0 {
+				return nil, fmt.Errorf("no files match %q", arg)
+			}
+			continue
+		}
+		st, err := os.Stat(arg)
+		if err != nil {
+			return nil, err
+		}
+		if !st.IsDir() {
+			add(arg)
+			continue
+		}
+		entries, err := os.ReadDir(arg)
+		if err != nil {
+			return nil, err
+		}
+		var names []string
+		for _, e := range entries {
+			if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") && !strings.HasPrefix(e.Name(), "~$") && isSupportedExt(e.Name()) {
+				names = append(names, e.Name())
+			}
+		}
+		if len(names) == 0 {
+			return nil, fmt.Errorf("no CSV or Excel files in %s", arg)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			add(filepath.Join(arg, n))
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no files given")
+	}
+	return out, nil
+}
+
+// CheckSameFormat makes sure all files can be imported together: they must
+// be supported and all CSV-like or all Excel.
+func CheckSameFormat(paths []string) error {
+	var first Format
+	for i, p := range paths {
+		f := DetectFormat(p)
+		if f == FormatUnknown {
+			return fmt.Errorf("unsupported file type %q (only .csv/.txt/.tsv and .xlsx/.xlsm are supported)", filepath.Ext(p))
+		}
+		if i == 0 {
+			first = f
+		} else if f != first {
+			return fmt.Errorf("cannot import %s and %s together: %s is %s, %s is %s",
+				filepath.Base(paths[0]), filepath.Base(p), filepath.Base(paths[0]), first, filepath.Base(p), f)
+		}
+	}
+	return nil
+}
+
+// OptionsFor returns the source options to use for a file. The first file
+// uses base as is. For further files the Excel sheet is chosen by name (or
+// the only sheet) and, with AutoDetect, CSV delimiter and encoding are
+// detected again.
+func OptionsFor(path string, base SourceOptions, first bool) (SourceOptions, error) {
+	if first {
+		return base, nil
+	}
+	switch DetectFormat(path) {
+	case FormatXLSX:
+		if base.Sheet == "" {
+			return base, nil
+		}
+		sheets, err := ListSheets(path)
+		if err != nil {
+			return base, err
+		}
+		for _, s := range sheets {
+			if s == base.Sheet {
+				return base, nil
+			}
+		}
+		if len(sheets) == 1 {
+			base.Sheet = sheets[0]
+			return base, nil
+		}
+		return base, fmt.Errorf("sheet %q not found (sheets: %s)", base.Sheet, strings.Join(sheets, ", "))
+	case FormatCSV:
+		if base.AutoDetect {
+			d, e, err := SniffCSV(path)
+			if err != nil {
+				return base, err
+			}
+			base.Delimiter, base.Encoding = d, e
+		}
+	}
+	return base, nil
 }

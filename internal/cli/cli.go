@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -70,21 +71,36 @@ func newImportCmd() *cobra.Command {
 		headerRow, startRow                                          int
 		skip, only, types                                            []string
 		keepEmpty, dryRun                                            bool
+		sourceColumn                                                 string
 	)
 	cmd := &cobra.Command{
-		Use:   "import <file>",
-		Short: "Import a CSV or Excel file into a database (non-interactive)",
+		Use:   "import <file|glob|dir>...",
+		Short: "Import one or more CSV or Excel files into a table (non-interactive)",
+		Long: `Imports CSV (.csv, .tsv, .txt) or Excel (.xlsx, .xlsm) files into a table.
+
+Several files (or patterns such as "sales_*.csv", or a directory) go into the
+same table. The first file defines names, types and skipped columns; the other
+files are mapped onto it by header, so their column order may differ. Columns
+missing in a file become NULL, additional columns are ignored. The import is
+all-or-nothing. With --source-column every row records the file it came from.`,
 		Example: `  tablequery import cities.csv --db data.db
   tablequery import report.xlsx --db data.db --sheet "Q1" --header-row 3 --table q1
   tablequery import export.csv --db data.db --delimiter ";" --skip "Kommentar,Intern" --if-exists replace
-  tablequery import export.csv --db data.db --type plz=TEXT --type umsatz=REAL --dry-run`,
-		Args: cobra.ExactArgs(1),
+  tablequery import export.csv --db data.db --type plz=TEXT --type umsatz=REAL --dry-run
+  tablequery import "sales_*.csv" --db data.db --table sales --source-column
+  tablequery import jan.xlsx feb.xlsx mar.xlsx --db data.db --table sales
+  tablequery import ./monthly-exports/ --db data.db --table sales --if-exists replace`,
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path := args[0]
-			format := importer.DetectFormat(path)
-			if format == importer.FormatUnknown {
-				return fmt.Errorf("unsupported file type: %s", path)
+			paths, err := importer.ExpandPaths(args)
+			if err != nil {
+				return err
 			}
+			if err := importer.CheckSameFormat(paths); err != nil {
+				return err
+			}
+			path := paths[0]
+			format := importer.DetectFormat(path)
 			opts := importer.SourceOptions{Sheet: sheet, HeaderRow: headerRow, StartRow: startRow, SkipEmpty: !keepEmpty}
 			if format == importer.FormatCSV {
 				d, e, err := importer.SniffCSV(path)
@@ -98,6 +114,8 @@ func newImportCmd() *cobra.Command {
 				if encoding != "" {
 					opts.Encoding = encoding
 				}
+				// Detect delimiter and encoding per file unless forced.
+				opts.AutoDetect = delimiter == "" && encoding == ""
 			}
 			switch decimal {
 			case "", "auto":
@@ -117,20 +135,38 @@ func newImportCmd() *cobra.Command {
 				return err
 			}
 			if table == "" {
-				s := ""
-				if format == importer.FormatXLSX && sheet != "" {
-					s = sheet
+				if len(paths) > 1 {
+					table = importer.CommonTableName(paths)
+					if table == "" {
+						return fmt.Errorf("--table is required when importing several files")
+					}
+				} else {
+					s := ""
+					if format == importer.FormatXLSX && sheet != "" {
+						s = sheet
+					}
+					table = importer.TableNameFor(path, s)
 				}
-				table = importer.TableNameFor(path, s)
 			}
-			t := importer.Target{Table: table, IfExists: ifExists, Columns: cols}
+			t := importer.Target{Table: table, IfExists: ifExists, Columns: cols, SourceColumn: sourceColumn}
 			if err := t.Validate(); err != nil {
 				return err
 			}
 			out := cmd.OutOrStdout()
+			if len(paths) > 1 {
+				fmt.Fprintf(out, "%d files; columns taken from %s, others mapped by header\n\n", len(paths), filepath.Base(path))
+			}
 			printColumns(out, cols)
 			if dryRun {
 				fmt.Fprintln(out, "\n"+t.CreateTableSQL())
+				if len(paths) > 1 {
+					plan, err := importer.PlanFiles(paths, opts, cols)
+					if err != nil {
+						return err
+					}
+					fmt.Fprintln(out)
+					printFiles(out, plan)
+				}
 				return nil
 			}
 			if dbPath == "" {
@@ -143,11 +179,15 @@ func newImportCmd() *cobra.Command {
 			defer d.Close()
 			ctx, cancel := signalContext()
 			defer cancel()
-			res, err := importer.Import(ctx, d.DB, path, opts, t, nil)
+			res, err := importer.ImportFiles(ctx, d.DB, paths, opts, t, nil)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(out, "\nImported %d rows into %s (%s)\n", res.Rows, res.Table, dbPath)
+			fmt.Fprintln(out)
+			if len(res.Files) > 1 {
+				printFiles(out, res.Files)
+			}
+			fmt.Fprintf(out, "Imported %d rows from %d file(s) into %s (%s)\n", res.Rows, len(res.Files), res.Table, dbPath)
 			if res.Warnings > 0 {
 				fmt.Fprintf(out, "%d values could not be converted and were stored as text, e.g.:\n", res.Warnings)
 				for _, s := range res.Samples {
@@ -170,9 +210,34 @@ func newImportCmd() *cobra.Command {
 	f.StringSliceVar(&skip, "skip", nil, "columns to skip (source header or normalized name), comma separated")
 	f.StringSliceVar(&only, "columns", nil, "only import these columns (source header or normalized name)")
 	f.StringArrayVar(&types, "type", nil, "override a column type: name=INTEGER|REAL|TEXT|DATE|DATETIME|BOOLEAN (repeatable)")
+	f.StringVar(&sourceColumn, "source-column", "", "add a column with the source file name per row (default name: source_file)")
+	f.Lookup("source-column").NoOptDefVal = "source_file"
 	f.BoolVar(&keepEmpty, "keep-empty", false, "keep rows where all cells are empty")
 	f.BoolVar(&dryRun, "dry-run", false, "only show the detected columns and the CREATE TABLE statement")
 	return cmd
+}
+
+// printFiles lists the files of a multi-file import with mapping notes.
+func printFiles(w io.Writer, files []importer.FileResult) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, f := range files {
+		var notes []string
+		if len(f.Missing) > 0 {
+			notes = append(notes, "missing (NULL): "+strings.Join(f.Missing, ", "))
+		}
+		if len(f.Extra) > 0 {
+			notes = append(notes, "ignored: "+strings.Join(f.Extra, ", "))
+		}
+		if f.Warnings > 0 {
+			notes = append(notes, fmt.Sprintf("%d unconvertible values", f.Warnings))
+		}
+		rows := ""
+		if f.Rows > 0 {
+			rows = fmt.Sprintf("%d rows", f.Rows)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", filepath.Base(f.Path), rows, strings.Join(notes, "; "))
+	}
+	tw.Flush()
 }
 
 func matchesColumn(c importer.Column, name string) bool {
